@@ -3,18 +3,20 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const WebSocket = require("ws");
+const path = require("path");
 
+// Node 18+ has fetch built-in
+// If for any reason fetch is missing, Render Node has it.
 const { HttpRequest } = require("@aws-sdk/protocol-http");
 const { SignatureV4 } = require("@aws-sdk/signature-v4");
 const { Hash } = require("@aws-sdk/hash-node");
 const { EventStreamMarshaller } = require("@aws-sdk/eventstream-marshaller");
 const { toUtf8, fromUtf8 } = require("@aws-sdk/util-utf8-node");
 
-// ===== config =====
 const PORT = process.env.PORT || 4001;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+const TRUSTCHECK_API_BASE = process.env.TRUSTCHECK_API_BASE; // e.g. https://q4lp4xk3q4.execute-api.us-east-1.amazonaws.com
 
-// Credentials from env (simple, reliable)
 function credentialsProvider() {
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
@@ -25,12 +27,12 @@ function credentialsProvider() {
   return Promise.resolve({ accessKeyId, secretAccessKey, sessionToken });
 }
 
-// ===== helpers =====
 const marshaller = new EventStreamMarshaller(toUtf8, fromUtf8);
 
+// RFC3986 encode for SigV4
 function encodeRFC3986(str) {
   return encodeURIComponent(str)
-    .replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
 function buildQueryString(query) {
@@ -40,11 +42,8 @@ function buildQueryString(query) {
     const v = query[k];
     if (v === undefined || v === null) continue;
     if (Array.isArray(v)) {
-      // For arrays, include each value separately (sorted)
-      const vals = v.map(x => String(x)).sort();
-      for (const vv of vals) {
-        pairs.push(`${encodeRFC3986(k)}=${encodeRFC3986(vv)}`);
-      }
+      const vals = v.map((x) => String(x)).sort();
+      for (const vv of vals) pairs.push(`${encodeRFC3986(k)}=${encodeRFC3986(vv)}`);
     } else {
       pairs.push(`${encodeRFC3986(k)}=${encodeRFC3986(String(v))}`);
     }
@@ -58,13 +57,11 @@ function formatSignedUrl({ protocol, hostname, port, path, query }) {
 }
 
 async function buildTranscribePresignedUrl({ languageCode, sampleRate, mediaEncoding }) {
-  // Amazon Transcribe streaming WebSocket endpoint (port 8443)
   const hostname = `transcribestreaming.${AWS_REGION}.amazonaws.com`;
   const protocol = "wss:";
   const port = 8443;
-  const path = "/stream-transcription-websocket";
+  const wsPath = "/stream-transcription-websocket";
 
-  // Required query params: language-code, media-encoding, sample-rate
   const query = {
     "language-code": languageCode,
     "media-encoding": mediaEncoding,
@@ -76,10 +73,11 @@ async function buildTranscribePresignedUrl({ languageCode, sampleRate, mediaEnco
     hostname,
     port,
     method: "GET",
-    path,
+    path: wsPath,
     query,
     headers: {
       host: `${hostname}:8443`,
+      // IMPORTANT: do NOT include content-type in signed headers for ws handshake
     },
   });
 
@@ -90,9 +88,7 @@ async function buildTranscribePresignedUrl({ languageCode, sampleRate, mediaEnco
     sha256: Hash.bind(null, "sha256"),
   });
 
-  // Presigned URL expires max 300s is typical; 60s is enough for demo.
   const signed = await signer.presign(request, { expiresIn: 60 });
-
   return formatSignedUrl({
     protocol: signed.protocol,
     hostname: signed.hostname,
@@ -128,17 +124,39 @@ function extractTranscriptParts(json) {
   return out;
 }
 
-// ===== app =====
 const app = express();
 app.use(cors({ origin: true }));
+app.use(express.json({ limit: "1mb" }));
 
-const path = require("path");
-
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "live.html"));
-});
-
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "live.html")));
 app.get("/health", (_, res) => res.status(200).send("ok"));
+
+/**
+ * Proxy: analyze text via AWS API Gateway (avoids CORS issues on client)
+ * POST /analyze-text  body: { text: "..." }
+ */
+app.post("/analyze-text", async (req, res) => {
+  try {
+    if (!TRUSTCHECK_API_BASE) {
+      return res.status(500).json({ error: "TRUSTCHECK_API_BASE is not set on server env." });
+    }
+    const text = (req.body?.text || "").toString();
+    if (!text || text.length < 5) {
+      return res.status(400).json({ error: "text is too short" });
+    }
+
+    const r = await fetch(`${TRUSTCHECK_API_BASE}/v1/analyze/text`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.status).json(data);
+  } catch (e) {
+    return res.status(500).json({ error: "proxy_failed", details: String(e?.message || e) });
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: true, methods: ["GET", "POST"] } });
@@ -184,7 +202,7 @@ io.on("connection", (socket) => {
             socket.emit("error", { message: `Transcribe exception: ${eventType || "Unknown"} ${errTxt}` });
             return;
           }
-        } catch (e) {
+        } catch {
           // ignore parsing errors
         }
       });
@@ -207,13 +225,11 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("audio", (msg = {}) => {
+  // We send binary ArrayBuffer from client
+  socket.on("audio", (arrayBuffer) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const b64 = msg.chunkBase64;
-    if (!b64) return;
-
     try {
-      const audioBytes = Buffer.from(b64, "base64");
+      const audioBytes = Buffer.from(arrayBuffer);
       const payload = marshaller.marshall({
         headers: {
           ":message-type": { type: "string", value: "event" },
