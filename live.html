@@ -4,19 +4,44 @@
   <meta charset="utf-8"/>
   <title>TrustCheck Live STT</title>
   <style>
-    body { font-family: Arial, sans-serif; padding: 16px; max-width: 900px; margin: 0 auto; }
+    body { font-family: Arial, sans-serif; padding: 16px; max-width: 980px; margin: 0 auto; }
     button { margin-right: 8px; padding: 10px 14px; }
-    .row { display: flex; gap: 12px; align-items: center; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .card { background: #f4f4f4; padding: 12px; border-radius: 10px; }
     pre { background: #f4f4f4; padding: 12px; white-space: pre-wrap; border-radius: 8px; }
     #partial { opacity: 0.7; }
+    .badge { padding: 6px 10px; border-radius: 999px; font-weight: 700; display: inline-block; }
+    .low { background: #d7f7d7; }
+    .medium { background: #fff1c2; }
+    .high { background: #ffd1d1; }
+    .muted { opacity: 0.7; }
   </style>
 </head>
 <body>
-  <h2>TrustCheck: Live Speech-to-Text</h2>
-  <div class="row">
+  <h2>TrustCheck: Live Speech-to-Text + Live Risk</h2>
+
+  <div class="row card">
     <div id="status">status: idle</div>
     <button id="startBtn">Start</button>
     <button id="stopBtn" disabled>Stop</button>
+    <button id="analyzeBtn" disabled>Analyze transcript</button>
+    <span class="muted">Auto-analyze: every 5s (final transcript)</span>
+  </div>
+
+  <div class="row card">
+    <div>Risk:</div>
+    <div id="riskBadge" class="badge medium">MEDIUM</div>
+    <div id="riskScore" class="muted">score: -</div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Summary</div>
+    <div id="summary">—</div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Red flags</div>
+    <ul id="flags"></ul>
   </div>
 
   <h3>Final transcript</h3>
@@ -27,20 +52,51 @@
 
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script>
-    const WS_URL = "http://localhost:4001";
-    const socket = io(WS_URL);
+    // Connect to same origin (Render) and force WebSocket transport (better for Telegram WebView)
+    const socket = io(window.location.origin, { transports: ["websocket"] });
 
     const statusEl = document.getElementById("status");
     const finalEl = document.getElementById("final");
     const partialEl = document.getElementById("partial");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const analyzeBtn = document.getElementById("analyzeBtn");
+
+    const riskBadge = document.getElementById("riskBadge");
+    const riskScoreEl = document.getElementById("riskScore");
+    const summaryEl = document.getElementById("summary");
+    const flagsEl = document.getElementById("flags");
 
     let audioContext, processor, source, stream;
     let isRunning = false;
     let finalText = "";
+    let lastAnalyzedText = "";
+    let analyzeInFlight = false;
+    let lastPartialTs = 0;
 
     function setStatus(s) { statusEl.textContent = "status: " + s; }
+
+    function setRisk(level, score) {
+      const lvl = (level || "medium").toLowerCase();
+      riskBadge.className = "badge " + (lvl === "low" ? "low" : lvl === "high" ? "high" : "medium");
+      riskBadge.textContent = (lvl || "medium").toUpperCase();
+      riskScoreEl.textContent = "score: " + (score ?? "-");
+    }
+
+    function setSummary(t) { summaryEl.textContent = t || "—"; }
+
+    function setFlags(flags) {
+      flagsEl.innerHTML = "";
+      if (!Array.isArray(flags) || flags.length === 0) return;
+      for (const f of flags) {
+        const li = document.createElement("li");
+        const t = f.type || "flag";
+        const sev = f.severity || "";
+        const ev = f.evidence || "";
+        li.textContent = `${t} (${sev}): ${ev}`;
+        flagsEl.appendChild(li);
+      }
+    }
 
     function downsampleBuffer(buffer, sampleRate, outRate) {
       if (outRate === sampleRate) return buffer;
@@ -74,21 +130,48 @@
       return new Uint8Array(buf);
     }
 
-    function uint8ToBase64(u8) {
-      let binary = "";
-      const chunkSize = 0x8000;
-      for (let i = 0; i < u8.length; i += chunkSize) {
-        const sub = u8.subarray(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, sub);
+    async function analyzeText(text) {
+      if (!text || text.length < 30) return;
+      if (analyzeInFlight) return;
+      analyzeInFlight = true;
+      try {
+        const r = await fetch("/analyze-text", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text })
+        });
+        const data = await r.json().catch(() => ({}));
+        setRisk(data.risk_level, data.risk_score);
+        setSummary(data.summary);
+        setFlags(data.red_flags);
+      } catch (e) {
+        setSummary("Risk analyze failed (temporary).");
+      } finally {
+        analyzeInFlight = false;
       }
-      return btoa(binary);
     }
 
-    socket.on("status", (m) => setStatus(m.state));
+    // Auto-analyze every 5 seconds if final text changed
+    setInterval(() => {
+      if (!isRunning) return;
+      if (finalText && finalText !== lastAnalyzedText && finalText.length >= 30) {
+        lastAnalyzedText = finalText;
+        analyzeText(finalText);
+      }
+    }, 5000);
+
+    socket.on("status", (m) => {
+      setStatus(m.state);
+      if (m.state === "streaming") analyzeBtn.disabled = false;
+    });
+
     socket.on("error", (m) => setStatus("error: " + m.message));
 
     socket.on("transcript", (m) => {
       if (m.isPartial) {
+        const now = Date.now();
+        if (now - lastPartialTs < 200) return;
+        lastPartialTs = now;
         partialEl.textContent = m.text;
       } else {
         partialEl.textContent = "";
@@ -101,6 +184,7 @@
       if (isRunning) return;
       isRunning = true;
       finalText = "";
+      lastAnalyzedText = "";
       finalEl.textContent = "";
       partialEl.textContent = "";
       setStatus("requesting mic...");
@@ -109,14 +193,15 @@
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       source = audioContext.createMediaStreamSource(stream);
 
-      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      processor = audioContext.createScriptProcessor(2048, 1, 1); // lower latency
 
       processor.onaudioprocess = (e) => {
         if (!isRunning) return;
         const input = e.inputBuffer.getChannelData(0);
         const down = downsampleBuffer(input, audioContext.sampleRate, 16000);
         const pcm16 = floatTo16BitPCM(down);
-        socket.emit("audio", { chunkBase64: uint8ToBase64(pcm16) });
+        // Send binary to server (faster than base64)
+        socket.emit("audio", pcm16.buffer);
       };
 
       source.connect(processor);
@@ -126,6 +211,7 @@
 
       startBtn.disabled = true;
       stopBtn.disabled = false;
+      analyzeBtn.disabled = false;
     }
 
     async function stop() {
@@ -146,6 +232,8 @@
 
     startBtn.onclick = start;
     stopBtn.onclick = stop;
+
+    analyzeBtn.onclick = () => analyzeText(finalText);
   </script>
 </body>
 </html>
