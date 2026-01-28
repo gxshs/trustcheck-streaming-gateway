@@ -1,0 +1,21 @@
+{
+  "name": "trustcheck-streaming-ws-min",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "ws": "^8.18.0",
+    "@aws-sdk/protocol-http": "3.374.0",
+    "@aws-sdk/signature-v4": "3.374.0",
+    "@aws-sdk/hash-node": "3.374.0",
+    "@aws-sdk/eventstream-marshaller": "3.120.0",
+    "@aws-sdk/util-utf8-node": "3.259.0"
+  }
+}

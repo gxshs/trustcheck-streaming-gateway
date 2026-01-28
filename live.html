@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>TrustCheck Live STT</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; max-width: 900px; margin: 0 auto; }
+    button { margin-right: 8px; padding: 10px 14px; }
+    .row { display: flex; gap: 12px; align-items: center; }
+    pre { background: #f4f4f4; padding: 12px; white-space: pre-wrap; border-radius: 8px; }
+    #partial { opacity: 0.7; }
+  </style>
+</head>
+<body>
+  <h2>TrustCheck: Live Speech-to-Text</h2>
+  <div class="row">
+    <div id="status">status: idle</div>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <h3>Final transcript</h3>
+  <pre id="final"></pre>
+
+  <h3>Partial</h3>
+  <pre id="partial"></pre>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const WS_URL = "http://localhost:4001";
+    const socket = io(WS_URL);
+
+    const statusEl = document.getElementById("status");
+    const finalEl = document.getElementById("final");
+    const partialEl = document.getElementById("partial");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    let audioContext, processor, source, stream;
+    let isRunning = false;
+    let finalText = "";
+
+    function setStatus(s) { statusEl.textContent = "status: " + s; }
+
+    function downsampleBuffer(buffer, sampleRate, outRate) {
+      if (outRate === sampleRate) return buffer;
+      const ratio = sampleRate / outRate;
+      const newLen = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLen);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+        let accum = 0, count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+          accum += buffer[i];
+          count++;
+        }
+        result[offsetResult] = accum / count;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+      }
+      return result;
+    }
+
+    function floatTo16BitPCM(float32Array) {
+      const len = float32Array.length;
+      const buf = new ArrayBuffer(len * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < len; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return new Uint8Array(buf);
+    }
+
+    function uint8ToBase64(u8) {
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < u8.length; i += chunkSize) {
+        const sub = u8.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, sub);
+      }
+      return btoa(binary);
+    }
+
+    socket.on("status", (m) => setStatus(m.state));
+    socket.on("error", (m) => setStatus("error: " + m.message));
+
+    socket.on("transcript", (m) => {
+      if (m.isPartial) {
+        partialEl.textContent = m.text;
+      } else {
+        partialEl.textContent = "";
+        finalText += (finalText ? " " : "") + m.text;
+        finalEl.textContent = finalText;
+      }
+    });
+
+    async function start() {
+      if (isRunning) return;
+      isRunning = true;
+      finalText = "";
+      finalEl.textContent = "";
+      partialEl.textContent = "";
+      setStatus("requesting mic...");
+
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      source = audioContext.createMediaStreamSource(stream);
+
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        if (!isRunning) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down = downsampleBuffer(input, audioContext.sampleRate, 16000);
+        const pcm16 = floatTo16BitPCM(down);
+        socket.emit("audio", { chunkBase64: uint8ToBase64(pcm16) });
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      socket.emit("start", { languageCode: "en-US", sampleRateHertz: 16000 });
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    }
+
+    async function stop() {
+      if (!isRunning) return;
+      isRunning = false;
+      socket.emit("stop");
+
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+
+      if (processor) processor.disconnect();
+      if (source) source.disconnect();
+      if (audioContext) await audioContext.close();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+
+      setStatus("idle");
+    }
+
+    startBtn.onclick = start;
+    stopBtn.onclick = stop;
+  </script>
+</body>
+</html>
