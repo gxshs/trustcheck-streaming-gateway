@@ -131,6 +131,13 @@ function extractTranscriptParts(json) {
 // ===== app =====
 const app = express();
 app.use(cors({ origin: true }));
+
+const path = require("path");
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "live.html"));
+});
+
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
 const server = http.createServer(app);
